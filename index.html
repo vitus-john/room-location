@@ -1,61 +1,208 @@
-<button id="restrictedButton" disabled>Click Me</button>
-<p id="status">Checking location...</p>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Robust Room Geofence</title>
+<style>
+  body{font-family:system-ui,Arial;margin:20px}
+  .status {font-weight:bold;margin:10px 0}
+  button{padding:10px 16px;border-radius:8px;font-size:16px}
+  pre{background:#f6f6f6;padding:10px;border-radius:6px}
+</style>
+</head>
+<body>
+  <h2>Room Geofence (robust)</h2>
+  <p id="coords">Coords: --</p>
+  <p id="debug">Debug: --</p>
+  <p class="status" id="status">Checking...</p>
+  <button id="restrictedButton" disabled>Click Me (only inside)</button>
+  <pre id="log"></pre>
 
 <script>
+/* ====== CONFIG: replace polygon with yours (lat, lon) ====== */
 const roomPolygon = [
   [6.244521, 6.208141],
   [6.244476, 6.208149],
   [6.244477, 6.208152],
   [6.244473, 6.208153],
   [6.244457, 6.208160],
-  [6.244456, 6.208156],
+  [6.244456, 6.208156]
 ];
 
-function isPointInPolygon(point, polygon) {
-  const [x, y] = point;
+/* Parameters you can tweak */
+const SMOOTH_WINDOW = 4;        // how many recent positions to average
+const OUT_CONSENSUS = 3;        // how many consecutive "outside" readings before disable
+const IN_CONSENSUS = 1;         // how many consecutive "inside" readings to enable
+const EXTRA_BUFFER_METERS = 2;   // extra safety buffer (meters)
+const MAX_ACCEPTABLE_ACCURACY = 50; // if accuracy worse, show warning (meters)
+
+/* UI elements */
+const button = document.getElementById('restrictedButton');
+const coordsEl = document.getElementById('coords');
+const statusEl = document.getElementById('status');
+const debugEl = document.getElementById('debug');
+const logEl = document.getElementById('log');
+
+/* History for smoothing */
+let recentPositions = []; // {lat, lon, acc}
+
+/* Debounce counters */
+let consecutiveOutside = 0;
+let consecutiveInside = 0;
+
+/* Helper: simple ray-casting point-in-polygon (lat,lon order) */
+function pointInPolygon(point, vs) {
+  const [x, y] = point; // lat, lon
   let inside = false;
-
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const xi = polygon[i][0], yi = polygon[i][1];
-    const xj = polygon[j][0], yj = polygon[j][1];
-
+  for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+    const xi = vs[i][0], yi = vs[i][1];
+    const xj = vs[j][0], yj = vs[j][1];
     const intersect = ((yi > y) !== (yj > y)) &&
       (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
     if (intersect) inside = !inside;
   }
-
   return inside;
 }
 
-const button = document.getElementById('restrictedButton');
-const statusEl = document.getElementById('status');
-
-if (navigator.geolocation) {
-  navigator.geolocation.watchPosition(
-    position => {
-      const lat = position.coords.latitude;
-      const lon = position.coords.longitude;
-
-      const inside = isPointInPolygon([lat, lon], roomPolygon);
-
-      if (inside) {
-        button.disabled = false;
-        statusEl.textContent = "✅ You are inside the room.";
-      } else {
-        button.disabled = true;
-        statusEl.textContent = "❌ You are outside the room.";
-      }
-    },
-    error => {
-      statusEl.textContent = "Error: " + error.message;
-    },
-    { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
-  );
-} else {
-  statusEl.textContent = "Geolocation not supported by this browser.";
+/* Convert lat/lon differences to meters using equirectangular approx (good for small areas) */
+function latLonToXYMeters(lat, lon, refLat, refLon) {
+  const Rm = 111320; // meters per degree approx for latitude
+  const x = (lon - refLon) * Math.cos(refLat * Math.PI/180) * Rm;
+  const y = (lat - refLat) * Rm;
+  return [x, y];
 }
 
-button.addEventListener('click', () => {
-  alert('You clicked inside the room!');
-});
+/* Distance from point to line segment in meters (using planar approx) */
+function pointToSegmentDistanceMeters(pt, a, b, refLat, refLon) {
+  const p = latLonToXYMeters(pt[0], pt[1], refLat, refLon);
+  const A = latLonToXYMeters(a[0], a[1], refLat, refLon);
+  const B = latLonToXYMeters(b[0], b[1], refLat, refLon);
+
+  const vx = B[0] - A[0], vy = B[1] - A[1];
+  const wx = p[0] - A[0], wy = p[1] - A[1];
+  const vv = vx*vx + vy*vy;
+  let t = vv === 0 ? 0 : (vx*wx + vy*wy) / vv;
+  t = Math.max(0, Math.min(1, t));
+  const projx = A[0] + t*vx;
+  const projy = A[1] + t*vy;
+  const dx = p[0] - projx, dy = p[1] - projy;
+  return Math.sqrt(dx*dx + dy*dy);
+}
+
+/* Minimum distance from point to polygon edges */
+function minDistanceToPolygonMeters(point, polygon) {
+  if (!polygon || polygon.length === 0) return Infinity;
+  // Use mean lat/lon as reference for projection
+  const meanLat = polygon.reduce((s,p)=>s+p[0],0)/polygon.length;
+  const meanLon = polygon.reduce((s,p)=>s+p[1],0)/polygon.length;
+  let minD = Infinity;
+  for (let i=0, j=polygon.length-1; i<polygon.length; j=i++) {
+    const d = pointToSegmentDistanceMeters(point, polygon[j], polygon[i], meanLat, meanLon);
+    if (d < minD) minD = d;
+  }
+  return minD;
+}
+
+/* Smooth: average last N positions (simple arithmetic mean) */
+function smoothedPosition() {
+  if (recentPositions.length === 0) return null;
+  const n = recentPositions.length;
+  const sum = recentPositions.reduce((acc,p)=>{
+    acc.lat += p.lat;
+    acc.lon += p.lon;
+    acc.acc += (p.acc || 0);
+    return acc;
+  }, {lat:0, lon:0, acc:0});
+  return { lat: sum.lat/n, lon: sum.lon/n, acc: sum.acc/n };
+}
+
+/* Main checking logic */
+function handlePosition(pos) {
+  const lat = pos.latitude;
+  const lon = pos.longitude;
+  const acc = pos.accuracy || 0;
+
+  // push to history (keep at most SMOOTH_WINDOW)
+  recentPositions.push({lat, lon, acc});
+  if (recentPositions.length > SMOOTH_WINDOW) recentPositions.shift();
+
+  const s = smoothedPosition();
+  if (!s) return;
+
+  coordsEl.textContent = `Coords: ${s.lat.toFixed(6)}, ${s.lon.toFixed(6)}  (acc ≈ ${Math.round(s.acc)} m)`;
+  debugEl.textContent = `Raw: ${lat.toFixed(6)}, ${lon.toFixed(6)} acc:${Math.round(acc)}m  | smoothed acc:${Math.round(s.acc)}m`;
+
+  // If accuracy is too bad, don't change state quickly — show warning
+  if (s.acc > MAX_ACCEPTABLE_ACCURACY) {
+    statusEl.textContent = `Accuracy poor (${Math.round(s.acc)} m). Move near window or use phone GPS.`;
+    statusEl.style.color = 'orange';
+    logEl.textContent = 'STATUS: accuracy too poor — not changing geofence state.';
+    return;
+  }
+
+  // 1) fast test: point-in-polygon on smoothed point
+  const insidePoly = pointInPolygon([s.lat, s.lon], roomPolygon);
+
+  // 2) distance test: if outside polygon, compute min distance to polygon edge
+  let minDist = 0;
+  if (!insidePoly) {
+    minDist = minDistanceToPolygonMeters([s.lat, s.lon], roomPolygon);
+  }
+
+  // 3) accuracy-aware check:
+  //    If the user's accuracy circle overlaps polygon (i.e., minDist <= s.acc + EXTRA_BUFFER_METERS),
+  //    consider them INSIDE (because actual location could still be inside)
+  const consideredInside = insidePoly || (minDist <= (s.acc + EXTRA_BUFFER_METERS));
+
+  // 4) debounce logic
+  if (consideredInside) {
+    consecutiveInside++;
+    consecutiveOutside = 0;
+  } else {
+    consecutiveOutside++;
+    consecutiveInside = 0;
+  }
+
+  // Determine final enabled state (require multiple outs to disable)
+  if (consecutiveInside >= IN_CONSENSUS) {
+    button.disabled = false;
+    statusEl.textContent = '✅ You are inside the room (confirmed).';
+    statusEl.style.color = 'green';
+  } else if (consecutiveOutside >= OUT_CONSENSUS) {
+    button.disabled = true;
+    statusEl.textContent = '❌ You are outside the room (confirmed).';
+    statusEl.style.color = 'red';
+  } else {
+    // transitional state — show approximate
+    statusEl.textContent = consideredInside ? '⏳ Probably inside (waiting for confirmation)...' : '⏳ Probably outside (waiting for confirmation)...';
+    statusEl.style.color = 'gray';
+  }
+
+  logEl.textContent = `minDist(m): ${minDist.toFixed(2)} | consideredInside: ${consideredInside} | consecIn: ${consecutiveInside} | consecOut: ${consecutiveOutside}`;
+}
+
+/* Start watching position */
+if ('geolocation' in navigator) {
+  navigator.geolocation.watchPosition(
+    p => handlePosition({
+      latitude: p.coords.latitude,
+      longitude: p.coords.longitude,
+      accuracy: p.coords.accuracy
+    }),
+    err => {
+      statusEl.textContent = 'Error getting position: ' + err.message;
+      statusEl.style.color = 'orange';
+    },
+    { enableHighAccuracy: true, maximumAge: 1000, timeout: 8000 }
+  );
+} else {
+  statusEl.textContent = 'Geolocation not supported in this browser.';
+  statusEl.style.color = 'gray';
+}
+
+/* Button action */
+button.addEventListener('click', () => alert('Clicked while inside!'));
 </script>
+</body>
+</html>
