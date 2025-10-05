@@ -1,104 +1,61 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Room Location Detection</title>
-  <style>
-    body {
-      font-family: Arial, sans-serif;
-      text-align: center;
-      margin-top: 50px;
-    }
-    #status {
-      margin-top: 20px;
-      font-weight: bold;
-    }
-    button {
-      font-size: 18px;
-      padding: 10px 20px;
-      border-radius: 10px;
-      cursor: pointer;
-    }
-    button:disabled {
-      background: #aaa;
-      cursor: not-allowed;
-    }
-  </style>
-</head>
-<body>
-  <h2>Room Geofence Detection</h2>
-  <p id="coords">Coordinates: --</p>
-  <p id="status">Checking location...</p>
-  <button id="restrictedButton" disabled>Click Me</button>
+<button id="restrictedButton" disabled>Click Me</button>
+<p id="status">Checking location...</p>
 
-  <script>
-    // --- Your Room Polygon Coordinates ---
-    const roomPolygon = [
-      [6.244521, 6.208141],
-      [6.244476, 6.208149],
-      [6.244477, 6.208152],
-      [6.244473, 6.208153],
-      [6.244457, 6.208160],
-      [6.244456, 6.208156]
-    ];
+<script>
+const roomPolygon = [
+  [6.244521, 6.208141],
+  [6.244476, 6.208149],
+  [6.244477, 6.208152],
+  [6.244473, 6.208153],
+  [6.244457, 6.208160],
+  [6.244456, 6.208156],
+];
 
-    // --- Point-in-Polygon (Ray Casting Algorithm) ---
-    function pointInPolygon(point, polygon) {
-      const [x, y] = point; // lat, lon
-      let inside = false;
+function isPointInPolygon(point, polygon) {
+  const [x, y] = point;
+  let inside = false;
 
-      for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-        const xi = polygon[i][0], yi = polygon[i][1];
-        const xj = polygon[j][0], yj = polygon[j][1];
-        const intersect = ((yi > y) !== (yj > y)) &&
-                          (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-        if (intersect) inside = !inside;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i][0], yi = polygon[i][1];
+    const xj = polygon[j][0], yj = polygon[j][1];
+
+    const intersect = ((yi > y) !== (yj > y)) &&
+      (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+
+  return inside;
+}
+
+const button = document.getElementById('restrictedButton');
+const statusEl = document.getElementById('status');
+
+if (navigator.geolocation) {
+  navigator.geolocation.watchPosition(
+    position => {
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+
+      const inside = isPointInPolygon([lat, lon], roomPolygon);
+
+      if (inside) {
+        button.disabled = false;
+        statusEl.textContent = "✅ You are inside the room.";
+      } else {
+        button.disabled = true;
+        statusEl.textContent = "❌ You are outside the room.";
       }
+    },
+    error => {
+      statusEl.textContent = "Error: " + error.message;
+    },
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 5000 }
+  );
+} else {
+  statusEl.textContent = "Geolocation not supported by this browser.";
+}
 
-      return inside;
-    }
-
-    const button = document.getElementById('restrictedButton');
-    const status = document.getElementById('status');
-    const coordsDisplay = document.getElementById('coords');
-
-    // --- Continuous Location Tracking ---
-    if ('geolocation' in navigator) {
-      navigator.geolocation.watchPosition(position => {
-        const lat = position.coords.latitude;
-        const lon = position.coords.longitude;
-        coordsDisplay.textContent = `Coordinates: ${lat.toFixed(6)}, ${lon.toFixed(6)}`;
-        // document.write("Your current position:", position.coords.latitude, position.coords.longitude);
-        const inside = pointInPolygon([lat, lon], roomPolygon);
-
-        if (inside) {
-          button.disabled = false;
-          status.textContent = "✅ You are inside the room area.";
-          status.style.color = "green";
-        } else {
-          button.disabled = true;
-          status.textContent = "❌ You are outside the room area.";
-          status.style.color = "red";
-        }
-
-      }, error => {
-        status.textContent = "Error getting location: " + error.message;
-        status.style.color = "orange";
-      }, {
-        enableHighAccuracy: true,
-        maximumAge: 1000,
-        timeout: 5000
-      });
-    } else {
-      status.textContent = "Geolocation is not supported by your browser.";
-      status.style.color = "gray";
-    }
-
-    // --- Button Action ---
-    button.addEventListener('click', () => {
-      alert('Button clicked — you are inside the room!');
-    });
-  </script>
-</body>
-</html>
+button.addEventListener('click', () => {
+  alert('You clicked inside the room!');
+});
+</script>
